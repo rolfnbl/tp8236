@@ -1,11 +1,9 @@
 import sys
 import time
-
 import serial
 import serial.tools.list_ports
 import threading
 from typing import TypedDict
-
 import nist_scales as factors
 
 
@@ -50,6 +48,15 @@ __tp8236_lcdmap__ = {0x5F: '0',
 class DmmData(TypedDict):
     timestamp: float | None
     rawdata: list[int] | None
+
+
+debug = False
+
+
+def debug_print(string):
+    if debug:
+        print(string)
+    pass
 
 
 class TP8236:
@@ -133,21 +140,23 @@ class TP8236:
         """
         if data is None:
             # if the data is None, get the most recent data, and process it.
+            debug_print (f' # Measurements = {len(self.__measurements__)}')
             if len(self.__measurements__) == 0:
                 return None
-            data = self.__measurements__[0]
+            while len(self.__measurements__) > 0:
+                data = self.__measurements__.pop(0)
         else:
             data = DmmData(timestamp=data["timestamp"], rawdata=data["rawdata"])
         # process the bytes
-        print(data["timestamp"])
+        debug_print(data["timestamp"])
         # Interpret the primary digits, including sign.
         # This is the LCD primary display map, which is specific for the TP8236
         datastring = ''
-        dlist = data['rawdata']
+        dlist = data['rawdata'].copy()
         for byte in dlist:
             if dlist != '':
                 datastring = datastring + ' '
-            datastring = datastring + f'0x{byte: 02X}'
+            datastring = datastring + f'0x{byte:02x}'
         display = ''
         unit = ''
         mult = 1
@@ -162,7 +171,8 @@ class TP8236:
         # i.e.   8.8.8.8
         #        ^
         if dlist[9] in __tp8236_lcdmap__.keys():
-            display = display + __tp8236_lcdmap__[dlist[9] & 0x7F]
+            tbyte = dlist[9] & 0x7F
+            display = display + __tp8236_lcdmap__[tbyte]
             dlist[9] = dlist[9] & ~0x7F  # clear bits
         else:
             errstr = f'Unknown LCD mapping at byte [9] EGFDCBA = {dlist[9]}\n  Full string {datastring}'
@@ -206,7 +216,11 @@ class TP8236:
         else:
             errstr = f'Unknown LCD mapping at byte [6] EGFDCBA = {dlist[6]}\n  Full string: {datastring}'
             raise ValueError(errstr)
-        value = float(display)
+        try:
+            value = float(display)
+        except ValueError:
+            value = None
+        debug_print(f'Value: {value}')
         display = display + ' '  # terminate number with a space
         # add units which are in Bytes 20 and 21
         # Degrees C Icon
@@ -387,8 +401,10 @@ class TP8236:
                 errstr = errstr + f'\n  Full string: {datastring}'
                 print(errstr)
                 raise ValueError(errstr)
+        if value is not None:
+            value = value * mult
         return DmmMeasurement(timestamp=data['timestamp'], rawdata=data['rawdata'], display=display,
-                              value=value * mult, units=unit, flags=flags, name=self.devName)
+                              value=value, units=unit, flags=flags, name=self.devName)
 
     def __serial_thread__(self):
         """
@@ -404,28 +420,29 @@ class TP8236:
                 for b in new_data:
                     self.__rawdata__.append(b)
             # search for synchronization byte.  Likely in front but could come in asynchronous.  This is most like
-            while len(self.__rawdata__) > 1:
-                if (self.__rawdata__[0] == __tp8236_checkdata__[0] and
-                        self.__rawdata__[1] == __tp8236_checkdata__[1]):
-                    break
-                self.__rawdata__.pop(0)  # not found.  Discard lead byte, keep looking!
-            # new_frame holds the 22 data bytes.  This is only filled if there are 22 raw data bytes.  The first two
-            #   bytes have already at this point been verified as the synchronization byte.
-            new_frame = []
             while len(self.__rawdata__) > 22:
-                for j in range(22):
-                    # Fill the new frame with exactly 22 bytes.
-                    new_frame.append(self.__rawdata__.pop(0))
-                # todo get timestamp
-                timestamp = None
-                # Create the measurement structure.  The two required items are the timestamp and data.  No further
-                #   action will occur in the thread.  This will be processed in as the measurement is queried, in the
-                #   non-threaded task.
-                new_measurement = {"timestamp": timestamp, "rawdata": new_frame}
-                if len(self.__measurements__) >= self.__depth__:
-                    #  Remove the oldest measurements to make room
-                    self.__measurements__.pop(0)  #
-                self.__measurements__.append(new_measurement)  # add new data at the beginning of the queue.
+                while len(self.__rawdata__) > 1:
+                    if (self.__rawdata__[0] == __tp8236_checkdata__[0] and
+                            self.__rawdata__[1] == __tp8236_checkdata__[1]):
+                        break
+                    self.__rawdata__.pop(0)  # not found.  Discard lead byte, keep looking!
+                # new_frame holds the 22 data bytes.  This is only filled if there are 22 raw data bytes.  The first two
+                #   bytes have already at this point been verified as the synchronization byte.
+                while len(self.__rawdata__) >= 22:
+                    new_frame = []
+                    for j in range(22):
+                        # Fill the new frame with exactly 22 bytes.
+                        new_frame.append(self.__rawdata__.pop(0))
+                    # todo get timestamp
+                    timestamp = None
+                    # Create the measurement structure.  The two required items are the timestamp and data.  No further
+                    #   action will occur in the thread.  This will be processed in as the measurement is queried, in
+                    #   the non-threaded task.
+                    new_measurement = {"timestamp": timestamp, "rawdata": new_frame}
+                    if len(self.__measurements__) >= self.__depth__:
+                        #  Remove the oldest measurements to make room
+                        self.__measurements__.pop(0)  #
+                    self.__measurements__.append(new_measurement)  # add new data at the beginning of the queue.
             time.sleep(0.05)  # wait for next data
 
 
@@ -440,7 +457,7 @@ if __name__ == '__main__':
         print(f'  {index}: {portDevList[index].description}')
     inp = input('Please select from one of these ports: ')
     if len(indexes) == 0:
-        dmm = TP8236()
+        dmm = TP8236(name="My Dmm")
         # must be a dummy test
     elif inp not in indexes:
         print("Invalid Selection")
@@ -448,8 +465,10 @@ if __name__ == '__main__':
     else:
         dmm = TP8236(portDevList[int(inp)])
     if len(indexes) > 0:
-        number_of_samples = 1
+        number_of_samples = 100
         for i in range(number_of_samples):
-            time.sleep(1)
-            print(f'(time): {dmm.read()}')
+            time.sleep(.1)
+            reading = dmm.read()
+            if reading is not None:
+                print(f'{reading}')
         dmm.close()
